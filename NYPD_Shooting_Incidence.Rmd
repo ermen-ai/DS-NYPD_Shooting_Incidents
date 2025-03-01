@@ -1,0 +1,207 @@
+---
+title: "NYPD Shooting Incident Project"
+author: "Ermias"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(skimr)
+library(ggplot2) 
+library(caret)
+library(randomForest)
+library(knitr)
+```
+
+## R Markdown
+
+This is an R Markdown document. This markdown is created for the week 3 project regarding the NYPD Shooting Incident. The NYPD shooting incident data can be found  <https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD>.
+
+
+## Step 1 - Import the source data 
+
+Read the NYPD shooting incident CSV dataset
+
+```{r get_nypd_shooting_data}
+url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+```
+
+Let's read the data and see the contents of the datasets
+
+```{r import_data, message = FALSE}
+shooting_incident_df <- read_csv(url)
+print(shooting_incident_df, n=10)
+```
+
+## Step 2 - Clean up the dataset 
+Let's clean up the dataset by removing Latitude, Longitude, X_COORD_CD,Y_COORD_CD and Lon_Lat columns as well as change the data type for OCCUR_DATE to date
+
+```{r tidy_up_dataset}
+shooting_incident_df <- subset(shooting_incident_df, select = -c(Latitude,Longitude,X_COORD_CD,Y_COORD_CD,Lon_Lat) )
+
+shooting_incident_df$OCCUR_DATE <- mdy(shooting_incident_df$OCCUR_DATE)
+print(shooting_incident_df, n=10)
+```
+
+Let's see the summary of the dataset
+
+```{r summary_statistics}
+skim(shooting_incident_df)
+```
+
+Based on the summary data the following columns have a lot of missing records 
+        1. LOC_OF_OCCUR_DESC
+        2. LOC_CLASSFCTN_DESC
+        3. LOCATION_DESC
+We'll need to ignore these data variables from the analysis unless we have a way to impute this data from other sources
+
+## Step 3 - Analyze the data 
+```{r data_analysis_1}
+grouped_df <- shooting_incident_df %>% 
+    group_by(BORO) %>% 
+    summarize(Count = n(), .groups = "drop") %>%
+    arrange(desc(Count))
+print(grouped_df)
+```
+
+Based on the shooting incident data, Brooklyn Borough has the highest shooting incidents whereas Staten Island has the lowest
+
+```{r graph_data_analysis_1}
+grouped_df$BORO <- factor(grouped_df$BORO, levels = grouped_df$BORO[order(-grouped_df$Count)])
+ggplot(grouped_df, aes(x = BORO, y = Count, fill = BORO)) +
+    geom_bar(stat = "identity") +
+    theme_minimal() +
+    labs(
+        title = "Shooting Incident Count by Borough",
+        x = "Borough",
+        y = "Count"
+        ) +
+    scale_fill_manual(
+        values = c("BROOKLYN" = "red", 
+                   "BRONX" = "blue", 
+                   "QUEENS" = "orange", 
+                   "MANHATTAN" = "purple", 
+                   "STATEN ISLAND" ="green")
+        ) +
+    theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+        )
+```
+
+
+```{r data_analysis_2}
+grouped_df2 <- shooting_incident_df %>% 
+    group_by(VIC_AGE_GROUP,VIC_SEX) %>% 
+    summarize(Count = n(), .groups = "drop") %>%
+    arrange(desc(Count))
+print(grouped_df2)
+```
+
+Based on the shooting incident data, the majority of victims were male in the age group between 18 and 44. Some of the age groups and victim sex is not given in the data so for this analysis we can exclude the records with no valid values in these data elements
+
+```{r data_analysis_2a}
+excluded_age_groups <- c("UNKNOWN", "1022")
+excluded_sexes <- c("U", "X")
+grouped_df2 <- shooting_incident_df %>% 
+    filter(!(VIC_AGE_GROUP %in% excluded_age_groups | VIC_SEX %in% excluded_sexes)) %>%
+    group_by(VIC_AGE_GROUP,VIC_SEX) %>% 
+    summarize(Count = n(), .groups = "drop") %>%
+    arrange(desc(Count))
+print(grouped_df2)
+```
+```{r graph_data_analysis_2}
+grouped_df2$Group <- paste(grouped_df2$VIC_AGE_GROUP, grouped_df2$VIC_SEX, sep = "-")
+grouped_df2$Group <- factor(grouped_df2$Group, levels = grouped_df2$Group[order(-grouped_df2$Count)])
+ggplot(grouped_df2, aes(x = Group, y = Count, fill = VIC_SEX)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(
+    title = "Shooting Incident Count by Age Group and Sex",
+    x = "Age Group and Sex",
+    y = "Count"
+  ) +
+  scale_fill_manual(
+      values = c("M" = "blue", "F" = "pink")) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+  )
+```
+
+## Step 4. Predictive Modeling
+
+Develop a model to predict the borough (`BORO`) where a shooting incident is likely to occur based on available features.  
+
+```{r modeling}
+
+# Select relevant features and remove rows with missing values
+shooting_data <- shooting_incident_df %>%
+  mutate(Year = year(OCCUR_DATE),
+         Month = month(OCCUR_DATE, label = TRUE),
+         Hour = hour(OCCUR_TIME))
+  
+model_data <- shooting_data %>%
+  select(BORO, Year, Month, Hour, VIC_AGE_GROUP, VIC_RACE, VIC_SEX) %>%
+  drop_na()
+
+# Convert categorical variables as factors
+model_data <- model_data %>%
+  mutate(across(c(BORO, Month, VIC_AGE_GROUP, VIC_RACE, VIC_SEX), as.factor))
+
+# Split the data into training and testing sets
+set.seed(123)
+train_index <- createDataPartition(model_data$BORO, p = 0.7, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+# Train a Random Forest model
+rf_model <- randomForest(BORO ~ ., data = train_data, importance = TRUE)
+
+# Evaluate the model on the test set
+predictions <- predict(rf_model, test_data)
+conf_matrix <- confusionMatrix(predictions, test_data$BORO)
+
+# Display the confusion matrix
+conf_matrix
+```
+**Summary of the Predictive Model Output**
+
+1. The model correctly predicts the borough 48.3% of the time which is relatively low
+
+2. Brooklyn is Over-Predicted:
+
+   - Sensitivity = 84.72% → The model is very good at identifying Brooklyn cases 
+   
+   - Specificity = 38.87% → Many non-Brooklyn cases are wrongly classified as Brooklyn 
+   
+   - Precision (47.74%) is not great, Brooklyn predictions include many errors
+   
+3. Manhattan, Queens, and Staten Island are Badly Predicted
+
+   - Manhattan (7.45% Sensitivity)
+   
+   - Queens (8.28% Sensitivity)
+   
+   - Staten Island (6.20% Sensitivity): This is the worst-predicted borough; Staten Island shootings are almost never classified correctly.
+   
+4. The model heavily favors Brooklyn, possibly due to the volume of incidents we have in the dataset comes from Brooklyn.
+
+## Step 5 - Bias Identification
+```{r bias_identification}
+```
+
+There could be a number of Bias areas we need to watch out for when analyzing this data. Some of these biases are:
+
+1. High policing areas my have more incidents reported, creating a false impression of higher crime rates in those areas
+
+2. There could be potential biases in demographic data (age, race, gender)
+
+3. Some areas might be considered high crime areas due to population density hence looking at the total incident count and making generalization about the areas is inaccurate
